@@ -1102,6 +1102,23 @@ class DagsterInstance(DynamicPartitionsStore):
             asset_graph=job_def.asset_layer.asset_graph,
         )
 
+    def _get_repo_scoped_asset_node(
+        self,
+        asset_graph: "BaseAssetGraph",
+        asset_key: AssetKey,
+        remote_job_origin: Optional["RemoteJobOrigin"] = None,
+    ) -> Optional["BaseAssetNode"]:
+        from dagster._core.definitions.assets.graph.remote_asset_graph import RemoteAssetNode
+
+        if not asset_graph.has(asset_key):
+            return None
+        asset_node = asset_graph.get(asset_key)
+        if isinstance(asset_node, RemoteAssetNode):
+            return asset_node.resolve_to_repo_scoped_node(
+                check.not_none(remote_job_origin).repository_origin
+            )
+        return asset_node
+
     def _construct_run_with_snapshots(
         self,
         job_name: str,
@@ -1155,22 +1172,30 @@ class DagsterInstance(DynamicPartitionsStore):
                     asset_key = output.properties.asset_key if output.properties else None
                     adjusted_output = output
 
-                    if asset_key and asset_graph.has(asset_key):
-                        if partitions_definition is None:
-                            # this assumes that if one partitioned asset is in a run, all other partitioned
-                            # assets in the run have the same partitions definition.
-                            asset_node = asset_graph.get(asset_key)
+                    if asset_key:
+                        asset_node = self._get_repo_scoped_asset_node(
+                            asset_graph, asset_key, remote_job_origin
+                        )
+                        if asset_node:
                             partitions_definition = asset_node.partitions_def
 
-                        if (
-                            output.properties is not None
-                            and output.properties.asset_execution_type is None
-                        ):
-                            adjusted_output = output._replace(
-                                properties=output.properties._replace(
-                                    asset_execution_type=asset_graph.get(asset_key).execution_type
+                            if (
+                                partitions_definition is None
+                                and asset_node.partitions_def is not None
+                            ):
+                                # this assumes that if one partitioned asset is in a run, all other partitioned
+                                # assets in the run have the same partitions definition.
+                                partitions_definition = asset_node.partitions_def
+
+                            if (
+                                output.properties is not None
+                                and output.properties.asset_execution_type is None
+                            ):
+                                adjusted_output = output._replace(
+                                    properties=output.properties._replace(
+                                        asset_execution_type=asset_node.execution_type
+                                    )
                                 )
-                            )
 
                     adjusted_outputs.append(adjusted_output)
 
@@ -1331,6 +1356,7 @@ class DagsterInstance(DynamicPartitionsStore):
         step: "ExecutionStepSnap",
         output: "ExecutionStepOutputSnap",
         asset_graph: "BaseAssetGraph[BaseAssetNode]",
+        remote_job_origin: Optional["RemoteJobOrigin"],
     ) -> None:
         from dagster._core.definitions.partitions.context import partition_loading_context
         from dagster._core.definitions.partitions.definition import DynamicPartitionsDefinition
@@ -1358,7 +1384,11 @@ class DagsterInstance(DynamicPartitionsStore):
                     f" {ASSET_PARTITION_RANGE_END_TAG} set without the other"
                 )
 
-            partitions_def = asset_graph.get(asset_key).partitions_def
+            asset_node = check.not_none(
+                self._get_repo_scoped_asset_node(asset_graph, asset_key, remote_job_origin)
+            )
+
+            partitions_def = asset_node.partitions_def
             if (
                 isinstance(partitions_def, DynamicPartitionsDefinition)
                 and partitions_def.name is None
@@ -1423,6 +1453,7 @@ class DagsterInstance(DynamicPartitionsStore):
         dagster_run: DagsterRun,
         execution_plan_snapshot: "ExecutionPlanSnapshot",
         asset_graph: "BaseAssetGraph",
+        remote_job_origin: Optional["RemoteJobOrigin"],
     ) -> None:
         from dagster._core.events import DagsterEvent, DagsterEventType
 
@@ -1434,7 +1465,13 @@ class DagsterInstance(DynamicPartitionsStore):
                     asset_key = check.not_none(output.properties).asset_key
                     if asset_key:
                         self._log_materialization_planned_event_for_asset(
-                            dagster_run, asset_key, job_name, step, output, asset_graph
+                            dagster_run,
+                            asset_key,
+                            job_name,
+                            step,
+                            output,
+                            asset_graph,
+                            remote_job_origin,
                         )
 
                     if check.not_none(output.properties).asset_check_key:
@@ -1616,7 +1653,9 @@ class DagsterInstance(DynamicPartitionsStore):
         dagster_run = self._run_storage.add_run(dagster_run)
 
         if execution_plan_snapshot and not assets_are_externally_managed(dagster_run):
-            self._log_asset_planned_events(dagster_run, execution_plan_snapshot, asset_graph)
+            self._log_asset_planned_events(
+                dagster_run, execution_plan_snapshot, asset_graph, remote_job_origin
+            )
 
         return dagster_run
 
@@ -1689,6 +1728,7 @@ class DagsterInstance(DynamicPartitionsStore):
     def create_reexecuted_run(
         self,
         *,
+        request_context: "BaseWorkspaceRequestContext",
         parent_run: DagsterRun,
         code_location: "CodeLocation",
         remote_job: "RemoteJob",
@@ -1810,9 +1850,7 @@ class DagsterInstance(DynamicPartitionsStore):
             asset_check_selection=remote_job.asset_check_selection,
             remote_job_origin=remote_job.get_remote_origin(),
             job_code_origin=remote_job.get_python_origin(),
-            asset_graph=code_location.get_repository(
-                remote_job.repository_handle.repository_name
-            ).asset_graph,
+            asset_graph=request_context.asset_graph,
         )
 
     def register_managed_run(
